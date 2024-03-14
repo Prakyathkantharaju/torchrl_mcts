@@ -53,7 +53,8 @@ class MaxActionValue(TensorDictModuleBase):
             state_value = torch.argmax(
                 node[self.action_value_key], dim=-1, keepdim=True
             )[0]
-
+            if state_value.numel():
+                state_value = state_value.view(tensordict.batch_size + (1,))
         tensordict[self.state_value_key] = state_value
 
 
@@ -444,7 +445,9 @@ class SimulatedSearchPolicy(TensorDictModuleBase):
                 self._rollout.append(self.simulate(tensordict))
 
             with set_exploration_type(ExplorationType.MODE):
+                # print(tensordict['observation'], "tensor_dict")
                 tensordict = self.policy(tensordict)
+                # print(tensordict['observation'], "tensor_dict after")
             return tensordict
 
     def simulate(self, tensordict: TensorDictBase):
