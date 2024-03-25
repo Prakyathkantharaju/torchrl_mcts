@@ -4,15 +4,12 @@ import numpy as np
 import pytest
 import torch
 from tensordict import TensorDict
-from torchrl.envs import (
-    GymEnv,
-)
+from tensordict.nn import TensorDictModule
 from torchrl.modules import QValueActor, MLP
 
 from mcts.stateless_cliffwalking import StatelessCliffWalking
 from mcts.mcts_policy import (
     MctsPolicy,
-    ZeroExpansion,
     SimulatedSearchPolicy,
     UcbSelectionPolicy,
     ActionExplorationModule,
@@ -21,6 +18,8 @@ from mcts.mcts_policy import (
     PuctSelectionPolicy,
     safe_weighted_avg,
 )
+from mcts.stateless_cliffwalking import StatelessCliffWalking
+from mcts.stateless_frozenlake import StatelessFrozenLake
 from mcts.tensordict_map import TensorDictMap
 
 
@@ -51,8 +50,13 @@ def test_one_step():
 
     state = env.reset()
 
-    expansion_strategy = ZeroExpansion(
-        tree=TensorDictMap("observation"), num_action=env.action_spec.shape[-1]
+    expansion_strategy = AlphaZeroExpansionStrategy(
+        tree=TensorDictMap("observation"),
+        value_module=TensorDictModule(
+            module=lambda x: torch.zeros(env.action_spec.shape),
+            in_keys=["observation"],
+            out_keys=["action_value"],
+        ),
     )
 
     mcts_policy = MctsPolicy(
@@ -67,8 +71,13 @@ def test_one_step():
 def test_rollout() -> None:
     env = StatelessCliffWalking()
 
-    rollout_policy = ZeroExpansion(
-        tree=TensorDictMap("observation"), num_action=env.action_spec.shape[-1]
+    rollout_policy = AlphaZeroExpansionStrategy(
+        tree=TensorDictMap("observation"),
+        value_module=TensorDictModule(
+            module=lambda x: torch.zeros(env.action_spec.shape),
+            in_keys=["observation"],
+            out_keys=["action_value"],
+        ),
     )
 
     mcts_policy = MctsPolicy(
@@ -89,8 +98,13 @@ def test_simulated_search_policy():
     tree = TensorDictMap("observation")
     policy = SimulatedSearchPolicy(
         policy=MctsPolicy(
-            expansion_strategy=ZeroExpansion(
-                tree=tree, num_action=env.action_spec.shape[-1]
+            expansion_strategy=AlphaZeroExpansionStrategy(
+                tree=tree,
+                value_module=TensorDictModule(
+                    module=lambda x: torch.zeros(env.action_spec.shape),
+                    in_keys=["observation"],
+                    out_keys=["action_value"],
+                ),
             ),
         ),
         tree_updater=UpdateTreeStrategy(tree, num_action=env.action_spec.shape[-1]),
@@ -214,7 +228,7 @@ def test_puct_selection_policy(tensordict: TensorDict, expected_action: int):
 
 def test_update_tree():
     tree = TensorDictMap("observation")
-    tree_updater = UpdateTreeStrategy(tree=tree, num_action=2)
+    tree_updater = UpdateTreeStrategy(tree=tree)
 
     done_state = TensorDict(
         {
@@ -271,39 +285,39 @@ def test_update_tree():
 
 
 @pytest.mark.parametrize(
-    "w1,v1,w2,v2,expected_output",
+    "action_value,action_count,current_action,target_value,expected_output",
     [
         (
-            torch.Tensor([0, 1]),
-            torch.Tensor([0, 2]),
-            torch.Tensor([0, 0]),
-            torch.Tensor([1, 2]),
-            torch.Tensor([0, 2]),
+            torch.Tensor([1, 1]),  # initialized values
+            torch.Tensor([0, 0]),  # the count is zero as it just initialized
+            torch.Tensor([1, 0]),  # one-hot encoded value of new action
+            torch.Tensor([2]),  # target value (total reward) from selecting this action
+            torch.Tensor([2.0, 1]),
         ),
         (
-            torch.Tensor([0, 1]),
-            torch.Tensor([0, 2]),
-            torch.Tensor([1, 1]),
-            torch.Tensor([1, 1]),
-            torch.Tensor([1, 1.5]),
+            torch.Tensor([1.5, 1]),  # next round after initialization
+            torch.Tensor([1, 0]),  # first action only explored
+            torch.Tensor([1, 0]),  # first action get selected as it has higher value
+            torch.Tensor([-2.5]),  # negative reward
+            torch.Tensor([-0.5, 1]),
         ),
         (
-            torch.Tensor([0, 1]),
-            torch.Tensor([0, 2]),
-            torch.Tensor([0, 1]),
-            torch.Tensor([1]),
-            torch.Tensor([0, 1.5]),
+            torch.Tensor([-0.5, 1]),  # last round
+            torch.Tensor([2, 0]),  # second action has not been explored
+            torch.Tensor([0, 1]),  # second action selected
+            torch.Tensor([0.5]),  # reward of second action
+            torch.Tensor([-0.5, 0.5]),
         ),
     ],
 )
 def test_weighted_sum(
-    w1: torch.Tensor,
-    v1: torch.Tensor,
-    w2: torch.Tensor,
-    v2: torch.Tensor,
+    action_value: torch.Tensor,
+    action_count: torch.Tensor,
+    current_action: torch.Tensor,
+    target_value: torch.Tensor,
     expected_output: torch.Tensor,
 ):
-    avg = safe_weighted_avg(w1, v1, w2, v2)
+    avg = safe_weighted_avg(action_count, action_value, current_action, target_value)
     np.testing.assert_almost_equal(
         avg.detach().numpy(), expected_output.detach().numpy()
     )

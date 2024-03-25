@@ -3,8 +3,6 @@ from typing import cast
 import torch
 from tensordict import TensorDict
 from tensordict.nn import TensorDictModule
-from torchrl.envs import SelectTransform
-from torchrl.modules import QValueActor
 from torchrl.objectives.value import TDLambdaEstimator
 
 

@@ -1,6 +1,6 @@
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Iterable
 
 import torch
 from tensordict import TensorDictBase, TensorDict, NestedKey
@@ -57,6 +57,60 @@ class MaxActionValue(TensorDictModuleBase):
         tensordict[self.state_value_key] = state_value
 
 
+def safe_weighted_avg(
+    w1: torch.Tensor,
+    v1: torch.Tensor,
+    w2: torch.Tensor,
+    v2: torch.Tensor,
+):
+    total_weight = w1 + w2
+    mask = total_weight > 0
+    total_sum = w1 * v1 + w2 * v2
+    weighted_avg = torch.max(v1, w2 * v2)
+    weighted_avg[mask] = total_sum[mask].to(torch.float32) / total_weight[mask]
+    return weighted_avg
+
+
+class MaxActionValue(TensorDictModuleBase):
+    def __init__(
+        self,
+        tree: TensorDictMap,
+        action_value_key: str = "action_value",
+        state_value_key: str = "state_value",
+    ):
+        self.in_keys = tree.keys
+        self.out_keys = [state_value_key]
+        super().__init__()
+        self.tree = tree
+        self.state_value_key = state_value_key
+        self.action_value_key = action_value_key
+
+    def forward(self, tensordict: TensorDict):
+        if len(tensordict.batch_size) != 2:
+            raise ValueError(
+                f"Input tensordict expected to have a shape of batch x time_step but got {tensordict.batch_size}"
+            )
+        if tensordict.batch_size[0] != 1:
+            raise ValueError(
+                f"Current implementation only support batch size of 1 but got {tensordict.batch_size[0]}"
+            )
+        state_values = []
+        for step in tensordict.unbind(dim=1):
+            node = self.tree.get(step)
+
+            if node is None:
+                state_value = torch.zeros((1,))
+            else:
+                state_value = torch.max(
+                    node[self.action_value_key], dim=-1, keepdim=True
+                )[0]
+            state_values.append(state_value)
+
+        tensordict[self.state_value_key] = torch.stack(state_values, dim=0).unsqueeze(
+            dim=0
+        )
+
+
 class UpdateTreeStrategy:
     """
     The strategy to update tree after each rollout. This class uses the given value estimator
@@ -77,7 +131,6 @@ class UpdateTreeStrategy:
         self,
         tree: TensorDictMap,
         value_estimator: Optional[ValueEstimatorBase] = None,
-        num_action: Optional[int] = None,
         action_key: NestedKey = "action",
         action_value_key: NestedKey = "action_value",
         action_count_key: NestedKey = "action_count",
@@ -88,14 +141,10 @@ class UpdateTreeStrategy:
         self.action_value_key = action_value_key
         self.action_count_key = action_count_key
         self.chosen_action_value = chosen_action_value_key
-        self.value_estimator = value_estimator or self.get_default_value_network(
-            tree, num_action
-        )
+        self.value_estimator = value_estimator or self.get_default_value_network(tree)
 
     @staticmethod
-    def get_default_value_network(
-        tree: TensorDictMap, num_action: Optional[int]
-    ) -> ValueEstimatorBase:
+    def get_default_value_network(tree: TensorDictMap) -> ValueEstimatorBase:
         # noinspection PyTypeChecker
         return TDLambdaEstimator(
             gamma=1.0,
@@ -108,7 +157,7 @@ class UpdateTreeStrategy:
         tree = self.tree
         action_count_key = self.action_count_key
         action_value_key = self.action_value_key
-
+        r = torch.max(rollout[("next", "reward")]).item()
         # usually time is along the last dimension (if envs are batched for instance)
         steps = rollout.unbind(-1)
 
@@ -177,34 +226,6 @@ class ExpansionStrategy(TensorDictModuleBase):
     @abstractmethod
     def expand(self, tensordict: TensorDictBase) -> TensorDictBase:
         pass
-
-
-class ZeroExpansion(ExpansionStrategy):
-    """
-    A rollout policy to initialize a state with zero Q(s, a).
-    """
-
-    def __init__(
-        self,
-        tree: TensorDictMap,
-        num_action: int,
-        action_value_key: NestedKey = "action_value",
-        action_count_key: NestedKey = "action_count",
-    ):
-        super().__init__(tree=tree, out_keys=[action_value_key, action_count_key])
-        self.num_action = num_action
-        self.q_sa_key = action_value_key
-        self.n_sa_key = action_count_key
-
-    def expand(self, tensordict: TensorDictBase) -> TensorDict:
-        tensordict = tensordict.clone(False)
-        tensordict[self.q_sa_key] = torch.zeros(
-            tensordict.batch_size + (self.num_action,), dtype=torch.float32
-        )
-        tensordict[self.n_sa_key] = torch.zeros(
-            tensordict.batch_size + (self.num_action,), dtype=torch.long
-        )
-        return tensordict
 
 
 class AlphaZeroExpansionStrategy(ExpansionStrategy):
@@ -295,6 +316,8 @@ class PuctSelectionPolicy(TensorDictModuleBase):
 
         optimism_estimation = x_hat + u_sa
         tensordict[self.action_value_under_uncertainty_key] = optimism_estimation
+        tensordict[self.action_value_under_uncertainty_key] = optimism_estimation
+
         return tensordict
 
 
@@ -363,6 +386,7 @@ class ActionExplorationModule(TensorDictModuleBase):
             tensordict[self.action_key] = self.explore_action(tensordict)
         elif exploration_type() == ExplorationType.MODE:
             tensordict[self.action_key] = self.get_greedy_action(tensordict)
+
         return tensordict
 
     def get_greedy_action(self, node: TensorDictBase) -> torch.Tensor:
