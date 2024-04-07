@@ -1,6 +1,7 @@
 from abc import abstractmethod
 from dataclasses import dataclass
 from typing import List, Optional, Iterable
+from copy import copy
 
 import torch
 from tensordict import TensorDictBase, TensorDict, NestedKey
@@ -15,6 +16,10 @@ from torchrl.objectives.value import ValueEstimatorBase, TDLambdaEstimator
 from mcts.tensordict_map import TensorDictMap
 
 from tqdm import tqdm
+
+# temp import need to be removed after debug
+import numpy as np
+from collections import defaultdict
 
 def safe_weighted_avg(
     w1: torch.Tensor,
@@ -167,6 +172,8 @@ class UpdateTreeStrategy:
         target_value = target_value.squeeze(dim=0)
 
         target_values = target_value.unbind(rollout.ndim - 1)
+        observation = defaultdict(int)
+        actions_set = defaultdict(int)
         for idx in range(rollout.batch_size[-1]):
             state = steps[idx]
             node = tree[state]
@@ -178,9 +185,11 @@ class UpdateTreeStrategy:
                 action,
                 target_values[idx],
             )
-
             node[action_count_key] += action
             tree[state] = node
+        #     observation[torch.argmax(node['observation'], dim = -1).detach().numpy().item()] += 1
+        #     actions_set[torch.argmax(action, dim = -1).detach().numpy().item()] += 1
+        # print(observation, "observation", actions_set, "actions")
         
         # return rollout so that we can train the alpha zero testing.
         return rollout # we are returning this to avoid returning the again during the alphazero coding.
@@ -387,7 +396,6 @@ class ActionExplorationModule(TensorDictModuleBase):
             tensordict[self.action_key] = self.explore_action(tensordict)
         elif exploration_type() == ExplorationType.MODE:
             tensordict[self.action_key] = self.get_greedy_action(tensordict)
-
         return tensordict
 
     def get_greedy_action(self, node: TensorDictBase) -> torch.Tensor:
@@ -397,13 +405,68 @@ class ActionExplorationModule(TensorDictModuleBase):
 
     def explore_action(self, node: TensorDictBase) -> torch.Tensor:
         action_value = node[self.action_value_key]
-
         max_value, _ = torch.max(action_value, dim=-1)
         action = torch.argmax(
             torch.rand_like(action_value) * (action_value == max_value)
         )
         return torch.nn.functional.one_hot(action, action_value.shape[-1])
 
+
+
+class ActionExplorationModuleActionCheck(TensorDictModuleBase):
+    def __init__(
+        self,
+        env: EnvBase,
+        action_value_key: NestedKey = "action_value",
+        action_value_under_uncertainty_key: NestedKey = "action_value_under_uncertainty",
+        action_key: NestedKey = "action",
+    ):
+        self.in_keys = [action_value_key, action_value_under_uncertainty_key]
+        self.out_keys = [action_key]
+        super().__init__()
+        self.action_value_key = action_value_under_uncertainty_key
+        self.action_cnt_key = action_value_key
+        self.action_key = action_key
+        self.env = env
+
+    def forward(self, tensordict: TensorDictBase):
+        tensordict = tensordict.clone(False)
+
+        if exploration_type() == ExplorationType.RANDOM or exploration_type() is None:
+            tensordict[self.action_key] = self.explore_action(tensordict)
+        elif exploration_type() == ExplorationType.MODE:
+            tensordict[self.action_key] = self.get_greedy_action(tensordict)
+        return tensordict
+
+    def get_greedy_action(self, node: TensorDictBase) -> torch.Tensor:
+        action_cnt_key = self.action_cnt_key
+        action = torch.argmax(node[action_cnt_key], dim=-1)
+        return torch.nn.functional.one_hot(action, node[action_cnt_key].shape[-1])
+
+    def get_valid_action(self, node: TensorDictBase) -> torch.Tensor:
+        cur_state = torch.argmax(node['observation']).clone().detach().item()
+        action_space = self.env.P[cur_state]
+        valid_action = set()
+        for key, value in action_space.items():
+            
+            if value[0][1] != cur_state:
+                valid_action.add(key)
+            # print(key, value[0][1], cur_state, valid_action)
+
+        return valid_action
+
+        
+    def explore_action(self, node: TensorDictBase) -> torch.Tensor:
+        valid_action = list(self.get_valid_action(node))
+        action_value = node[self.action_value_key]
+        action_value_new = torch.zeros_like(action_value)
+        action_value_new[valid_action] = action_value[valid_action]
+        max_value, _ = torch.max(action_value_new, dim=-1)
+        action = torch.argmax(
+            torch.rand_like(action_value_new) * (action_value == max_value)
+        )
+        # print(torch.argmax(action), "action")
+        return torch.nn.functional.one_hot(action, action_value_new.shape[-1])
 
 @dataclass
 class MctsPolicy(TensorDictSequential):
@@ -466,12 +529,15 @@ class SimulatedSearchPolicy(TensorDictModuleBase):
             self.tree_updater.start_simulation()
 
             for i in range(self.num_simulation):
+                # print("Simulation", i)
                 self._rollout.append(self.simulate(tensordict))
+                # reset the env to avoid the side effect of the simulation reaching the end of the episode.
+                out = self.env.reset()
 
             with set_exploration_type(ExplorationType.MODE):
-                # print(tensordict['observation'], "tensor_dict")
+                print(torch.argmax(tensordict['observation']))
+                print(self.tree_updater.tree[tensordict]['action_count'])
                 tensordict = self.policy(tensordict)
-                # print(tensordict['observation'], "tensor_dict after")
             return tensordict
 
     def simulate(self, tensordict: TensorDictBase):
@@ -482,64 +548,66 @@ class SimulatedSearchPolicy(TensorDictModuleBase):
             tensordict=tensordict,
             auto_reset=False,
         )
+        print(rollout['next']['observation'])
+        print(rollout['next']['reward'])
         return self.tree_updater.update(rollout)
     
-@dataclass
-class SimulatedAlphaZeroSearchPolicy(TensorDictModuleBase):
-    """
-    A simulated search policy. In each step, it simulates `n` rollout of maximum steps of `max_steps`
-    using the given policy and then choose the best action given the simulation results.
+# @dataclass
+# class SimulatedAlphaZeroSearchPolicy(TensorDictModuleBase):
+#     """
+#     A simulated search policy. In each step, it simulates `n` rollout of maximum steps of `max_steps`
+#     using the given policy and then choose the best action given the simulation results.
 
-    Args:
-        policy: a policy to select action in each simulation rollout.
-        env: an environment to simulate a rollout
-        num_simulation: the number of simulation
-        max_steps: the max steps of each simulated rollout
+#     Args:
+#         policy: a policy to select action in each simulation rollout.
+#         env: an environment to simulate a rollout
+#         num_simulation: the number of simulation
+#         max_steps: the max steps of each simulated rollout
 
-    """
+#     """
 
-    def __init__(
-        self,
-        policy: MctsPolicy,
-        tree_updater: UpdateTreeStrategy,
-        env: EnvBase,
-        num_simulation: int,
-        max_steps: int,
-    ):
-        self.in_keys = policy.in_keys
-        self.out_keys = policy.out_keys
+#     def __init__(
+#         self,
+#         policy: MctsPolicy,
+#         tree_updater: UpdateTreeStrategy,
+#         env: EnvBase,
+#         num_simulation: int,
+#         max_steps: int,
+#     ):
+#         self.in_keys = policy.in_keys
+#         self.out_keys = policy.out_keys
 
-        super().__init__()
-        self.policy = policy
-        self.tree_updater = tree_updater
-        self.env = env
-        self.num_simulation = num_simulation
-        self.max_steps = max_steps
-        self._store_rollout = [] # This is temporary, we will remove this later.
-        self.rollout = None
+#         super().__init__()
+#         self.policy = policy
+#         self.tree_updater = tree_updater
+#         self.env = env
+#         self.num_simulation = num_simulation
+#         self.max_steps = max_steps
+#         self._store_rollout = [] # This is temporary, we will remove this later.
+#         self.rollout = None
 
-    def forward(self, tensordict: TensorDictBase, ):
-        with torch.no_grad():
-            self.tree_updater.start_simulation()
-            self._store_rollout.clear()
-            for i in tqdm(range(self.num_simulation)):
-                self.simulate(tensordict)
+#     def forward(self, tensordict: TensorDictBase, ):
+#         with torch.no_grad():
+#             self.tree_updater.start_simulation()
+#             self._store_rollout.clear()
+#             for i in tqdm(range(self.num_simulation)):
+#                 self.simulate(tensordict)
 
-            with set_exploration_type(ExplorationType.MODE):
-                tensordict = self.policy(tensordict)
-            rollout = torch.cat(self._store_rollout, dim=-1)
-            self._store_rollout.clear()
-            self.rollout = rollout
-            return tensordict
+#             with set_exploration_type(ExplorationType.MODE):
+#                 tensordict = self.policy(tensordict)
+#             rollout = torch.cat(self._store_rollout, dim=-1)
+#             self._store_rollout.clear()
+#             self.rollout = rollout
+#             return tensordict
 
-    def simulate(self, tensordict: TensorDictBase):
-        tensordict = tensordict.clone(False)
-        rollout = self.env.rollout(
-            max_steps=self.max_steps,
-            policy=self.policy,
-            tensordict=tensordict,
-            auto_reset=False,
-        )
-        self.tree_updater.update(rollout)
-        self._store_rollout.append(rollout)
+#     def simulate(self, tensordict: TensorDictBase):
+#         tensordict = tensordict.clone(False)
+#         rollout = self.env.rollout(
+#             max_steps=self.max_steps,
+#             policy=self.policy,
+#             tensordict=tensordict,
+#             auto_reset=False,
+#         )
+#         self.tree_updater.update(rollout)
+#         self._store_rollout.append(rollout)
         
