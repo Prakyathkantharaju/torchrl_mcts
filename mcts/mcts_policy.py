@@ -13,7 +13,7 @@ from torchrl.envs import EnvBase
 from torchrl.envs.utils import exploration_type, ExplorationType, set_exploration_type
 from torchrl.objectives.value import ValueEstimatorBase, TDLambdaEstimator
 
-from mcts.tensordict_map import TensorDictMap
+from tensordict_map import TensorDictMap
 
 from tqdm import tqdm
 
@@ -495,6 +495,9 @@ class UpdateTreeStrategy(TensorDictModuleBase):
         action_count_key: NestedKey = "action_count",
         chosen_action_value_key: NestedKey = "chosen_action_value",
     ):
+        self.in_keys = [rollout_key]
+        self.out_keys = [rollout_key]
+        super().__init__()
         self.tree = tree
         self.rollout_key = rollout_key
         self.action_key = action_key
@@ -502,7 +505,8 @@ class UpdateTreeStrategy(TensorDictModuleBase):
         self.action_count_key = action_count_key
         self.chosen_action_value = chosen_action_value_key
         self.value_estimator = value_estimator or self.get_default_value_network(tree)
-        super().__init__()
+        self.start_simulation()
+        
 
     @staticmethod
     def get_default_value_network(tree: TensorDictMap) -> ValueEstimatorBase:
@@ -515,15 +519,19 @@ class UpdateTreeStrategy(TensorDictModuleBase):
         )
     
     def forward(self, tensordict: TensorDictBase) -> TensorDictBase:
-        self.start_simulation()
+        rollout = tensordict[self.rollout_key]
+        print(rollout)
         return self.update(tensordict[self.rollout_key])
 
     def update(self, rollout: TensorDictBase) -> None:
         tree = self.tree
         action_count_key = self.action_count_key
         action_value_key = self.action_value_key
-        r = torch.max(rollout[("next", "reward")]).item()
+        # r = torch.max(rollout[("next", "reward")]).item()
         # usually time is along the last dimension (if envs are batched for instance)
+        if len(rollout.batch_size) == 0:
+            # Do not do anything here.
+            return rollout
         steps = rollout.unbind(-1)
 
         value_estimator_input = rollout.unsqueeze(dim=0)
@@ -552,11 +560,12 @@ class UpdateTreeStrategy(TensorDictModuleBase):
         self.tree.clear()
 
 @dataclass
-class MctsPolicyNew(TensorDictSequential):
+class MctsPolicyWithTreeUpdate(TensorDictSequential):
     """
     An implementation of MCTS algorithm.
 
     Args:
+        tree_updated_strategy: a policy to update the tree after each simulation.
         expansion_strategy: a policy to initialize stats of a node at its first visit.
         selection_strategy: a policy to select action in each state
         exploration_strategy: a policy to exploration vs exploitation
@@ -565,13 +574,13 @@ class MctsPolicyNew(TensorDictSequential):
     # noinspection PyTypeChecker
     def __init__(
         self,
-        tree_updated_strategy: UpdateTreeStrategyPolicy,
+        tree_update_strategy: UpdateTreeStrategy,
         expansion_strategy: ExpansionStrategy,
         selection_strategy: TensorDictModuleBase = UcbSelectionPolicy(),
         exploration_strategy: ActionExplorationModule = ActionExplorationModule(),
     ):
         super().__init__(
-            expansion_strategy, selection_strategy, exploration_strategy
+            tree_update_strategy, expansion_strategy, selection_strategy, exploration_strategy
         )  #
 @dataclass
 class MctsPolicy(TensorDictSequential):
