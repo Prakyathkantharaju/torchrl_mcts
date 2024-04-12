@@ -468,6 +468,111 @@ class ActionExplorationModuleActionCheck(TensorDictModuleBase):
         # print(torch.argmax(action), "action")
         return torch.nn.functional.one_hot(action, action_value_new.shape[-1])
 
+
+class UpdateTreeStrategy(TensorDictModuleBase):
+    """
+    The strategy to update tree after each rollout. This class uses the given value estimator
+    to compute a target value after each roll out and compute the mean of target values in the tree.
+
+    It also updates the number of time nodes get visited in tree.
+
+    Args:
+        tree: A TensorDictMap that store stats of the tree.
+        value_estimator: A ValueEstimatorBase that compute target value.
+        action_key: A key in the rollout TensorDict to store the selected action.
+        action_value_key: A key in the tree nodes that stores the mean of Q(s, a).
+        action_count_key: A key in the tree nodes that stores the number of times nodes get visited.
+    """
+
+    # noinspection PyTypeChecker
+    def __init__(
+        self,
+        tree: TensorDictMap,
+        value_estimator: Optional[ValueEstimatorBase] = None,
+        rollout_key:  NestedKey = "rollout",
+        action_key: NestedKey = "action",
+        action_value_key: NestedKey = "action_value",
+        action_count_key: NestedKey = "action_count",
+        chosen_action_value_key: NestedKey = "chosen_action_value",
+    ):
+        self.tree = tree
+        self.rollout_key = rollout_key
+        self.action_key = action_key
+        self.action_value_key = action_value_key
+        self.action_count_key = action_count_key
+        self.chosen_action_value = chosen_action_value_key
+        self.value_estimator = value_estimator or self.get_default_value_network(tree)
+        super().__init__()
+
+    @staticmethod
+    def get_default_value_network(tree: TensorDictMap) -> ValueEstimatorBase:
+        # noinspection PyTypeChecker
+        return TDLambdaEstimator(
+            gamma=1.0,
+            lmbda=1.0,
+            value_network=MaxActionValue(tree),
+            vectorized=False,  # Todo: use True instead and fix the error
+        )
+    
+    def forward(self, tensordict: TensorDictBase) -> TensorDictBase:
+        self.start_simulation()
+        return self.update(tensordict[self.rollout_key])
+
+    def update(self, rollout: TensorDictBase) -> None:
+        tree = self.tree
+        action_count_key = self.action_count_key
+        action_value_key = self.action_value_key
+        r = torch.max(rollout[("next", "reward")]).item()
+        # usually time is along the last dimension (if envs are batched for instance)
+        steps = rollout.unbind(-1)
+
+        value_estimator_input = rollout.unsqueeze(dim=0)
+        target_value = self.value_estimator.value_estimate(value_estimator_input)
+        target_value = target_value.squeeze(dim=0)
+
+        target_values = target_value.unbind(rollout.ndim - 1)
+        for idx in range(rollout.batch_size[-1]):
+            state = steps[idx]
+            node = tree[state]
+            action = state[self.action_key]
+
+            node[action_value_key] = safe_weighted_avg(
+                node[action_count_key],
+                node[action_value_key],
+                action,
+                target_values[idx],
+            )
+            node[action_count_key] += action
+            tree[state] = node
+        
+        # return rollout so that we can train the alpha zero testing.
+        return rollout # we are returning this to avoid returning the again during the alphazero coding.
+
+    def start_simulation(self):
+        self.tree.clear()
+
+@dataclass
+class MctsPolicyNew(TensorDictSequential):
+    """
+    An implementation of MCTS algorithm.
+
+    Args:
+        expansion_strategy: a policy to initialize stats of a node at its first visit.
+        selection_strategy: a policy to select action in each state
+        exploration_strategy: a policy to exploration vs exploitation
+    """
+
+    # noinspection PyTypeChecker
+    def __init__(
+        self,
+        tree_updated_strategy: UpdateTreeStrategyPolicy,
+        expansion_strategy: ExpansionStrategy,
+        selection_strategy: TensorDictModuleBase = UcbSelectionPolicy(),
+        exploration_strategy: ActionExplorationModule = ActionExplorationModule(),
+    ):
+        super().__init__(
+            expansion_strategy, selection_strategy, exploration_strategy
+        )  #
 @dataclass
 class MctsPolicy(TensorDictSequential):
     """
