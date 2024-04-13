@@ -51,11 +51,11 @@ class StatelessGymEnv(GymEnv):
         self._current_state = self.get_state(self.env)
 
     def _get_state(self, env: Any) -> Any:
-        # default lagic will work for Taxi and frozenlake
+        # default logic will work for Taxi and frozenlake
         return env.s 
 
     def _set_state(self, env: Any, state: torch.Tensor) -> Any:
-        # default lagic will work for Taxi and frozenlake
+        # default logic will work for Taxi and frozenlake
         env.s = state.item()
         return env
 
@@ -119,7 +119,7 @@ if __name__ == "__main__":
 
 
     def get_state(env: Any) -> Any:
-        # This is where you will add logic to get the state of the env. This is usefull, because the in some case the observation is different from state. But In stateless env you need state to be absolute with anything hidden.
+        # This is where you will add logic to get the state of the env. This is useful, because the in some case the observation is different from state. But In stateless env you need state to be absolute with anything hidden.
         return env.s 
 
     def set_state(env: Any, state: torch.Tensor) -> Any:
